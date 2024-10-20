@@ -1,0 +1,81 @@
+#!/usr/bin/perl
+
+# Copyright 1997-2024 Paul Walters
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#-----------------------------------------------------------------------------
+#
+# Program:      predict
+#
+# Purpose:      This program is a wrapper program to call all the prediction
+#		programs that make the appropriate predictions.
+#
+# Syntax:       predict <forecast_hours> [time]
+#
+# Options:      <forecast_hours> - specifies the number of hours in the future
+#                                  the network is going to be trained for.
+#		[time] - specifies the time of day for which to make the 
+#                        prediction from.  Defaults to the last set of data
+#                        available in the database.
+#
+# NOTE:  There is hard-coded path information in this program.
+#
+#-----------------------------------------------------------------------------
+
+use strict;
+use Config::Simple;
+
+my $cfg = new Config::Simple(syntax=>'SIMPLE') || die Config::Simple->error();
+$cfg->read("$ENV{HOME}/.weather-station.cfg") || $cfg->read("/home/weather/.weather-station.cfg") || die Config::Simple->error();
+
+my $NEURAL_ROOT = $cfg->param('neuralRoot');
+
+die "Usage: $0 <forecast_period> [time]\n" if ((@ARGV < 1 ) || (@ARGV > 2) || $NEURAL_ROOT eq '');
+
+my $forecast_time = "";
+$forecast_time = "\"$ARGV[1]\"" if ( @ARGV == 2 );
+
+chdir ("${NEURAL_ROOT}/neural.data");
+
+my $result=`${NEURAL_ROOT}/predict_humidity $ARGV[0] $forecast_time`;
+foreach my $line ( split(/\n/,$result) ) {
+	print "$line\n" if ( $line =~ /Predicted .* for .* is/ );
+}
+
+$result=`${NEURAL_ROOT}/predict_pressure $ARGV[0] $forecast_time`;
+foreach my $line ( split(/\n/,$result) ) {
+	print "$line\n" if ( $line =~ /Predicted .* for .* is/ );
+}
+
+$result=`${NEURAL_ROOT}/predict_pwx $ARGV[0] $forecast_time`;
+foreach my $line ( split(/\n/,$result) ) {
+	print "$line\n" if ( $line =~ /Predicted .* for .* is/ );
+}
+
+$result=`${NEURAL_ROOT}/predict_temperature $ARGV[0] $forecast_time`;
+foreach my $line ( split(/\n/,$result) ) {
+	print "$line\n" if ( $line =~ /Predicted .* for .* is/ );
+}
+
+$result=`${NEURAL_ROOT}/predict_wind_direction $ARGV[0] $forecast_time`;
+foreach my $line ( split(/\n/,$result) ) {
+	print "$line\n" if ( $line =~ /Predicted .* for .* is/ );
+}
+
+$result=`${NEURAL_ROOT}/predict_wind_speed $ARGV[0] $forecast_time`;
+foreach my $line ( split(/\n/,$result) ) {
+	print "$line\n" if ( $line =~ /Predicted .* for .* is/ );
+}
+
+exit 0;

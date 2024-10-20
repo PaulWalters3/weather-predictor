@@ -1,0 +1,233 @@
+#!/usr/bin/perl
+
+# Copyright 1997-2024 Paul Walters
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#-----------------------------------------------------------------------------
+#
+# Program:      predict_pressure
+#
+# Purpose:      This program retrieves the latest pressure observations in 
+#		the database and creates the necessary control files for 
+#		the Neural program to predict the weather.  The Neural
+#		program is called from within this program, then the results
+#		are stored into the database.
+#
+# Syntax:       predict_pressure <forecast_hours>
+#
+# Options:      <forecast_hours> - specifies the number of hours in the future
+#                                  the network is going to be trained for.
+#               [time] - specifies the time of day for which to make the
+#                        prediction from.  Defaults to the last set of data
+#                        available in the database.
+#
+# NOTE:  There is hard-coded path information in this program.
+#
+#-----------------------------------------------------------------------------
+
+use strict;
+use Config::Simple;
+
+my $cfg = new Config::Simple(syntax=>'SIMPLE') || die Config::Simple->error();
+$cfg->read("$ENV{HOME}/.weather-station.cfg") || $cfg->read("/home/weather/.weather-station.cfg") || die Config::Simple->error();
+
+my $NEURAL_ROOT = $cfg->param('neuralRoot');
+my $predictStation = $cfg->param('predictStation');
+my $runtimeDir = $cfg->param('runtimeDir') || '/run/weather';
+
+die usage() if ($NEURAL_ROOT eq '' || $predictStation eq '');
+
+require "${NEURAL_ROOT}/tools/common.pm";
+
+my $force = 0;
+my $last_obs = "";
+my $update = 1;
+my $verbose = 0;
+my $forecast_period = "";
+
+for ( my $i=0; $i < @ARGV; $i++ ) {
+        if ( $ARGV[$i] eq "--force" ) {
+                $force = 1;
+        }
+        elsif ( $ARGV[$i] eq "--last" && $i+1 < @ARGV ) {
+                $last_obs = $ARGV[++$i];
+        }
+        elsif ( $ARGV[$i] eq "--noupdate" ) {
+                $update = 0;
+        }
+        elsif ( $ARGV[$i] eq "--verbose" ) {
+                $verbose = 1;
+        }
+        elsif ( $forecast_period eq "" && $ARGV[$i] =~ /^\d+$/ ) {
+                $forecast_period = $ARGV[$i];
+        }
+        else {
+                usage();
+        }
+}
+
+usage() if ( $forecast_period eq "" );
+
+sub usage
+{
+        die "$0 <forecast_hours>\n";
+}
+
+END
+{
+        unlink "PRESSURE${forecast_period}.$$.TMP" if ( -e "PRESSURE${forecast_period}.$$.TMP" );
+}
+
+#chdir ("${NEURAL_ROOT}/neural.data");
+chdir($runtimeDir);
+system("/bin/cp ${NEURAL_ROOT}/neural.data/PRESSURE${forecast_period}.CON ${runtimeDir}");
+system("/bin/cp ${NEURAL_ROOT}/neural.data/PRESSURE${forecast_period}.WGHT ${runtimeDir}");
+
+$| = 1;
+
+use Time::Local;
+
+my $dbh = openDatabase();
+
+$last_obs = getLastObservationTime($dbh) if ( $last_obs eq "" );
+
+die "Can't determine last observation time\n" if ( $last_obs eq "" );
+
+my $forecast_time = computePredictionTime($forecast_period, $last_obs);
+
+print "Forecast time: $forecast_time\n" if ( $verbose );
+
+my $already_done = checkForPrediction($dbh, $forecast_time, 'pressure');
+
+if ( $already_done && !$force ) {
+        print "\nPressure already predicted for this time.\n";
+        $dbh->disconnect;
+        exit 0;
+}
+
+my @sids = getSites($dbh);
+
+print "Getting observations..." if ( $verbose );
+
+my $query = "
+        select unix_timestamp(time) as timestamp, site, pressure
+        from   observations
+        where  abs(unix_timestamp(time)-unix_timestamp('$last_obs')) < 1800 
+        order by site, timestamp
+";
+
+##print "$query\n";
+my $sth=$dbh->prepare ( $query );
+die "$DBI::errstr\n" if ( $DBI::err > 0 );
+$sth->execute;
+die "$DBI::errstr\n" if ( $DBI::err > 0 );
+
+my %data = ();
+while ( my $row = $sth->fetchrow_hashref() ) {
+        $data{$$row{site}} = $$row{pressure};
+}
+
+die "No observation for $last_obs.\n" if ( !exists $data{"$predictStation"} );
+
+print "Generating execute file..." if ( $verbose );
+
+my @t = ( $predictStation ); push(@t, @sids); @sids = @t;
+
+for ( my $i=0; $i<@sids; $i++ ) {
+        my $sid = $sids[$i];
+        my $pressure = $data{$sid};
+        $pressure = $data{"$predictStation"} if ( $pressure eq "" );
+        outputPressure($pressure,$forecast_period,".$$.TMP",($i+1==scalar(@sids)));
+}
+
+$sth->finish;
+
+#-----------------------------------------------------------------------------
+
+print "Executing Neural..." if ( $verbose );
+
+unlink ( "PRESSURE${forecast_period}.$$.OUT" );
+open ( PIPE, "|${NEURAL_ROOT}/neural" ) || die "Cannot start neural (!$)\n";
+print PIPE "CONTROL:PRESSURE${forecast_period}.CON\n";           	sleep 2;
+print PIPE "RESTORE WEIGHTS: PRESSURE${forecast_period}.WGHT\n"; 	sleep 2;
+print PIPE "LAYER INIT: NOINIT\n";       				sleep 2;
+print PIPE "OUTPUT FILE:PRESSURE${forecast_period}.$$.OUT\n";        	sleep 2;
+print PIPE "EXECUTE : PRESSURE${forecast_period}.$$.TMP\n";         	sleep 2;
+print PIPE "QUIT:\n";                    				sleep 2;
+close (PIPE);
+
+print "Done.\n" if ( $verbose );
+
+#-----------------------------------------------------------------------------
+
+print "Reading Results..." if ( $verbose );
+
+open ( IN, "PRESSURE${forecast_period}.$$.OUT" ) || die "Cannot open PRESSURE${forecast_period}.$$.OUT ($!).\n";
+
+my $scaled = <IN>;	# Only one line and only one value.
+chomp ( $scaled );
+print "SCALED = $scaled\n";
+my $pressure = unscale ( 25, 35, $scaled );
+print "PRESSURE = $pressure\n";
+close ( IN );
+
+print "Done.\n" if ( $verbose );
+
+END {
+	unlink ("PRESSURE${forecast_period}.$$.OUT");
+	unlink ("PRESSURE${forecast_period}.$$.TMP");
+};
+
+if ( $verbose ) {
+    printf ("Predicted pressure for %s is %5.2f (%f): ", $forecast_time,$pressure, $scaled);
+
+	my $query = "select pressure from predicted where time = '$forecast_time'";
+	my $sth = $dbh->prepare ( $query );
+	$sth->execute;
+	my $ref = $sth->fetchrow_hashref();
+	$sth->finish;
+
+	printf "\tPrevious: %5.2f ", $ref->{pressure};
+
+	$query = "select pressure from observations where site = '$predictStation' and abs(unix_timestamp(time)-unix_timestamp('$forecast_time')) < 1800 ";
+	$sth = $dbh->prepare ( $query );
+	$sth->execute;
+	$ref = $sth->fetchrow_hashref();
+	$sth->finish;
+
+	printf "\tActual: %5.2f\n", $ref->{pressure};
+}
+
+#-----------------------------------------------------------------------------
+
+if ( $update ) {
+	print "Updating database..." if ( $verbose );
+
+	$update = "INSERT ignore INTO predicted (time, pressure) VALUES \
+		   ('$forecast_time', $pressure) ";
+	$dbh->do ( $update );
+
+	    $update = "UPDATE predicted SET pressure = $pressure \
+			WHERE time = '$forecast_time' ";
+	    $dbh->do ( $update );
+
+	print STDERR "$DBI::errstr\n" if ( $DBI::err > 1 );
+
+	print "Done.\n" if ( $verbose );
+}
+
+#-----------------------------------------------------------------------------
+
+$dbh->disconnect;
+exit 0;
