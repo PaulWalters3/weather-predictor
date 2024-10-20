@@ -44,11 +44,16 @@ $cfg->read("$ENV{HOME}/.weather-station.cfg") || $cfg->read("/home/weather/.weat
 
 my $NEURAL_ROOT = $cfg->param('neuralRoot');
 my $predictStation = $cfg->param('predictStation');
+my $predictIgnoreSites = $cfg->param('predictIgnoreSites');
 my $runtimeDir = $cfg->param('runtimeDir') || '/run/weather';
 
 die usage() if ($NEURAL_ROOT eq '' || $predictStation eq '');
 
 require "${NEURAL_ROOT}/tools/common.pm";
+
+my $dbHost = $cfg->param('dbHost');
+my $dbPassword = $cfg->param('dbPassword');
+my $dbUser = $cfg->param('dbUser');
 
 my $force = 0;
 my $last_obs = "";
@@ -98,9 +103,9 @@ $| = 1;
 
 use Time::Local;
 
-my $dbh = openDatabase();
+my $dbh = openDatabase($dbHost, $dbUser, $dbPassword);
 
-$last_obs = getLastObservationTime($dbh) if ( $last_obs eq "" );
+$last_obs = getLastObservationTime($dbh, $predictStation) if ( $last_obs eq "" );
 
 die "Can't determine last observation time\n" if ( $last_obs eq "" );
 
@@ -116,7 +121,7 @@ if ( $already_done && !$force ) {
         exit 0;
 }
 
-my @sids = getSites($dbh);
+my @sids = getSites($dbh, $predictStation, $predictIgnoreSites);
 
 print "Getting observations..." if ( $verbose );
 

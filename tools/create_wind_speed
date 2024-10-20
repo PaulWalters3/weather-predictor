@@ -1,0 +1,129 @@
+#!/usr/bin/perl
+
+# Copyright 1997-2024 Paul Walters
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#-----------------------------------------------------------------------------
+#
+# Program:      create_wind_speed
+#
+# Purpose:      This program retrieves the wind speed observations from the
+#               observations table and creates a data file suitable for
+#               input to the Neural program.  This program also creates
+#               the appropriate control file for the Neural program for
+#               training the wind speed network.
+#
+# Syntax:       create_wind_speed <forecast_hours>
+#
+# Options:      <forecast_hours> - specifies the number of hours in the future
+#                                  the network is going to be trained for.
+#
+#-----------------------------------------------------------------------------
+
+use strict;
+use Config::Simple;
+
+my $cfg = new Config::Simple(syntax=>'SIMPLE') || die Config::Simple->error();
+$cfg->read("$ENV{HOME}/.weather-station.cfg") || $cfg->read("/home/weather/.weather-station.cfg") || die Config::Simple->error();
+
+my $NEURAL_ROOT = $cfg->param('neuralRoot');
+my $predictStation = $cfg->param('predictStation');
+my $predictIgnoreSites = $cfg->param('predictIgnoreSites');
+my $runtimeDir = $cfg->param('runtimeDir') || '/run/weather';
+
+require "${NEURAL_ROOT}/tools/common.pm";
+
+die "$0 <forecast_hours>\n" if ( @ARGV != 1 );
+
+my $dbHost = $cfg->param('dbHost');
+my $dbPassword = $cfg->param('dbPassword');
+my $dbUser = $cfg->param('dbUser');
+
+my $forecast_period = $ARGV[0];
+
+my $dbh = openDatabase($dbHost, $dbUser, $dbPassword);
+
+my @sids = getSites($dbh, $predictStation, $predictIgnoreSites);
+
+my $query = "
+        select unix_timestamp(time) as timestamp, site, wind_speed
+        from   observations
+";
+
+my $sth=$dbh->prepare ( $query );
+die "$DBI::errstr\n" if ( $DBI::err > 0 );
+$sth->execute;
+die "$DBI::errstr\n" if ( $DBI::err > 0 );
+
+my %data = ();
+while ( my $row = $sth->fetchrow_hashref() ) {
+        $data{$$row{timestamp}}->{$$row{site}} = $$row{wind_speed};
+}
+
+my $count=0;
+
+@sids = sort @sids;
+my @t = ( $predictStation ); push(@t, @sids); @sids = @t;
+
+foreach my $time ( sort keys %data ) {
+        my %sites = %{$data{$time}};
+
+        next if ( !exists $sites{$predictStation} );
+
+        foreach my $site ( @sids ) {
+		next if ( $site eq $predictStation );
+        	my $wind = $sites{$site};
+        	$wind = $sites{$predictStation} if ( $wind eq "" );
+        	outputWS($wind,$forecast_period,".DAT");
+        }
+
+        my ( $wind );
+        my $future = $time + ($forecast_period * 3600);
+        if ( exists $data{$future}->{$predictStation} ) {
+        	$wind = $data{$future}->{$predictStation};
+        }
+        else {
+        	$wind = $sites{$predictStation};
+        }
+        outputWS($wind,$forecast_period,".DAT",1);
+
+        $count++;
+}
+
+print "$count\n";
+
+$sth->finish;
+$dbh->disconnect;
+
+#
+# Time to create the Neural control file.
+# The number of hidden layers to be used is a function of the number of
+# input layers and number of output layers.  sqrt(input*output) + 1.
+#
+my $hidden = scalar(@sids);
+
+open ( FP, ">WS${forecast_period}.CON" ) || die "Cannot open WS${forecast_period}.CON (!$).\n";
+print FP "NETWORK MODEL: LAYER\n";
+print FP "LAYER INIT: ANNEAL\n";
+print FP "OUTPUT MODEL: GENERAL\n";
+print FP "OUTPUT FILE: WS${forecast_period}.OUT\n";
+printf FP "N INPUTS: %d\n", $hidden;
+print FP "N OUTPUTS: 1\n";
+printf FP "N HIDDEN1: %d\n", int(sqrt($hidden * 1))+1;
+print FP "N HIDDEN2: 0\n";
+print FP "TRAIN: WS${forecast_period}.DAT\n";
+
+close ( FP );
+
+exit 0;

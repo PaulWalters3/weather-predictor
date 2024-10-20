@@ -1,0 +1,147 @@
+#!/usr/bin/perl
+
+# Copyright 1997-2024 Paul Walters
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#-----------------------------------------------------------------------------
+#
+# Program:      create_temperature
+#
+# Purpose:      This program retrieves the temperature observations from the
+#               observations table and creates a data file suitable for
+#               input to the Neural program.  This program also creates
+#               the appropriate control file for the Neural program for
+#               training the temperature network.
+#
+# Syntax:       create_temperature <forecast_hours>
+#
+# Options:      <forecast_hours> - specifies the number of hours in the future
+#                                  the network is going to be trained for.
+#
+#-----------------------------------------------------------------------------
+
+use strict;
+use Config::Simple;
+
+my $cfg = new Config::Simple(syntax=>'SIMPLE') || die Config::Simple->error();
+$cfg->read("$ENV{HOME}/.weather-station.cfg") || $cfg->read("/home/weather/.weather-station.cfg") || die Config::Simple->error();
+
+my $NEURAL_ROOT = $cfg->param('neuralRoot');
+my $predictStation = $cfg->param('predictStation');
+my $predictIgnoreSites = $cfg->param('predictIgnoreSites');
+my $runtimeDir = $cfg->param('runtimeDir') || '/run/weather';
+
+require "${NEURAL_ROOT}/tools/common.pm";
+
+my $dbHost = $cfg->param('dbHost');
+my $dbPassword = $cfg->param('dbPassword');
+my $dbUser = $cfg->param('dbUser');
+
+my $csvOnly = 0;
+my $forecast_period = "";
+
+foreach my $arg (@ARGV) {
+	if ($arg eq '--csvOnly') {
+		$csvOnly = 1;
+	}
+	elsif ($arg =~ /^\d+$/) {
+		$forecast_period = $arg;
+	}
+}
+
+die "$0 [--csvOnly] <forecast_hours>\n" if ( $forecast_period eq '');
+
+my $dbh = openDatabase($dbHost, $dbUser, $dbPassword);
+
+my @sids = getSites($dbh, $predictStation, $predictIgnoreSites);
+
+my $query = "
+        select unix_timestamp(time) as timestamp, date_format(time,'%H') as hour, site, temperature
+        from   observations
+";
+
+my $sth=$dbh->prepare ( $query );
+die "$DBI::errstr\n" if ( $DBI::err > 0 );
+$sth->execute;
+die "$DBI::errstr\n" if ( $DBI::err > 0 );
+
+my %data = ();
+while ( my $row = $sth->fetchrow_hashref() ) {
+        $data{$$row{timestamp}}->{$$row{site}} = $$row{temperature};
+        $data{$$row{timestamp}}->{hour} = $$row{hour};
+}
+
+my $count=0;
+
+@sids = sort @sids;
+my @t = ( $predictStation ); push(@t, @sids); @sids = @t;
+
+my $fileExtension = ($csvOnly ? '.csv' : '.DAT');
+
+foreach my $time ( sort keys %data ) {
+        my %sites = %{$data{$time}};
+	my $hour = $data{$time}->{hour};
+
+        next if ( !exists $sites{$predictStation} );
+
+        outputTemperature($sites{$predictStation},$forecast_period,$fileExtension,$hour);
+
+        foreach my $site ( @sids ) {
+		next if ( $site eq $predictStation );
+        	my $temperature = $sites{$site};
+        	$temperature = $sites{$predictStation} if ( $temperature eq "" );
+        	outputTemperature($temperature,$forecast_period,$fileExtension);
+        }
+
+        my ( $temperature );
+        my $future = $time + ($forecast_period * 3600);
+        if ( exists $data{$future}->{$predictStation} ) {
+        	$temperature = $data{$future}->{$predictStation};
+        }
+        else {
+        	$temperature = $sites{$predictStation};
+        }
+        outputTemperature($temperature,$forecast_period,$fileExtension);
+
+        $count++;
+}
+
+print "$count\n";
+
+$sth->finish;
+$dbh->disconnect;
+
+if (!$csvOnly) {
+	#
+	# Time to create the Neural control file.
+	# The number of hidden layers to be used is a function of the number of
+	# input layers and number of output layers.  sqrt(input*output) + 1.
+	#
+	my $hidden = scalar(@sids)+1;		## One extra neuron for "hour"
+
+	open ( FP, ">TEMPERATURE${forecast_period}.CON" ) || die "Cannot open TEMPERATURE${forecast_period}.CON (!$).\n";
+	print FP "NETWORK MODEL: LAYER\n";
+	print FP "LAYER INIT: ANNEAL\n";
+	print FP "OUTPUT MODEL: GENERAL\n";
+	print FP "OUTPUT FILE: TEMPERATURE${forecast_period}.OUT\n";
+	printf FP "N INPUTS: %d\n", $hidden;
+	print FP "N OUTPUTS: 1\n";
+	printf FP "N HIDDEN1: %d\n", int(sqrt($hidden * 1))+1;
+	print FP "N HIDDEN2: 0\n";
+	print FP "TRAIN: TEMPERATURE${forecast_period}${fileExtension}\n";
+	close ( FP );
+}
+
+exit 0;
+
