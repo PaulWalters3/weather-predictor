@@ -1,0 +1,340 @@
+#!/usr/bin/perl
+
+# Copyright 1997-2024 Paul Walters
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#-----------------------------------------------------------------------------
+#
+# Program:      wx
+#
+# Purpose:      This program connects to the weather data server and retrieves
+#		all the observations needed by the weather forecasting system.
+#		The list of sites for which to obtain data is stored in the
+#		database.
+#
+# Syntax:       wx
+#
+# Note:		THIS STOPPED WORKING Feb 2017.  DISABLED IT AND WENT TO GETTING IT 
+# 		IN THE SAME PROCESS THAT COLLECTS DATA FOR THE LOCAL FORECAST.
+#
+#-----------------------------------------------------------------------------
+
+use DBI;
+use IO::Socket;
+use Config::Simple;
+
+my $cfg = new Config::Simple(syntax=>'SIMPLE') || die Config::Simple->error();
+$cfg->read("$ENV{HOME}/.weather-station.cfg") || $cfg->read("/home/weather/.weather-station.cfg") || die Config::Simple->error();
+
+my $dbHost = $cfg->param('dbHost');
+my $dbPassword = $cfg->param('dbPassword');
+my $dbUser = $cfg->param('dbUser');
+
+my $dbh = DBI->connect( "dbi:mysql:database=weather;host=$dbHost", $dbUser, $dbPassword, { PrintError => 0 });
+
+my %months = (
+	"Jan" => "01",
+	"Feb" => "02",
+	"Mar" => "03",
+	"Apr" => "04",
+	"May" => "05",
+	"Jun" => "06",
+	"Jul" => "07",
+	"Aug" => "08",
+	"Sep" => "09",
+	"Oct" => "10",
+	"Nov" => "11",
+	"Dec" => "12"
+);
+
+die "$DBI::errstr\n" if ( $DBI::err > 0 );
+
+# Get a list of sites that data is being collected from.  
+# See the DBI documentation for creating and executing
+# SQL statements within a Perl program.
+
+my $query = "SELECT site FROM sites";
+my $sth = $dbh->prepare ( $query );
+$sth->execute;
+my @sids = ();
+while ( $ref = $sth->fetchrow_hashref() ) {
+    @sids = (@sids, $ref->{site});
+}
+$sth->finish;
+
+die "No sites.\n" if ( @sids < 1 );
+
+# This is the name of the server and the port number to get the
+# data from.
+my @servers = ("madlab.sprl.umich.edu:3000", "rainmaker.wunderground.com:23");
+@servers = ("rainmaker.wunderground.com:23", "madlab.sprl.umich.edu:3000");
+
+my %degrees = ( 'NORTH', 0, 'NNE', 22.5, 'NE', 45, 'ENE', 67.5, 
+                      'EAST', 90, 'ESE', 112.5, 'SE', 135, 'SSE', 157.5, 
+                      'SOUTH', 180, 'SSW', 202.5, 'SW', 225, 'WSW', 247.5, 
+                      'WEST', 270, 'WNW', 292.5, 'NW', 315,
+                      'NNW', 337.5, 'VARIABLE', 0 );
+    
+my @valid_pwx = ('Clear','Partly Cloudy','Cloudy','Overcast','Scattered Clouds',
+                  'Mostly Cloudy', 'fog','haze','light drizzle',
+                  'moderate drizzle','heavy drizzle', 'mist', 'rain mist',
+                  'light rain mist', 'heavy rain mist',
+                  'light rain','moderate rain','heavy rain','blowing snow',
+                  'light snow','moderate snow','heavy snow','light thunder',
+                  'moderate thunder','heavy thunder','light thunderstorm',
+                  'moderate thunderstorm','heavy thunderstorm','snow',
+                  'moderate rain showers','light rain showers','ice crystals',
+                  'light snow showers','moderate snow showers','rain',
+                  'ice pellets','light sleet','moderate sleet','heavy sleet',
+                  'light freezing rain','thunder','smoke','dust','snow grains',
+                  'moderate freezing rain','heavy freezing rain' );
+    
+#
+# Attempt to connect to one of the servers.  Give up after 5 times per server.
+#
+
+my ($server,$port);
+
+for my $server_info ( @servers ) {
+    ($server,$port) = split(/\:/, $server_info);
+    for ( my $i=0; !( $remote = IO::Socket::INET->new( Proto    => "tcp",
+                    PeerAddr => $server, PeerPort => $port )) && ($i<5);
+          $i++ )
+    {
+        warn "Cannot connect to port $port at $server\n";
+        sleep 30;
+    }
+    last if ( $remote );
+}
+
+die "Failure to connect.  Giving up.\n" if ( !$remote );
+
+$state = 0;
+$sid = 0;
+
+if ( $port ne 3000 ) {
+    print $remote "\n"; sleep 5;
+}
+
+# Enter the state machine, the information that the remote server is sending
+# must be read and parsed.  Look for keywords to know when we are to send
+# information back.  When sending and receiving actual observations, the
+# observations must be parsed so the seperate conditions can be inserted into
+# the database.
+while ( ($state == 1) || ($line = <$remote>) ) {
+    $line =~ s/[\n\r]*//g;
+    #print "$line\n";
+    if ( $state == 0 ) {
+        $line =~ s/[\n\r\s]*//;
+        if ( $line eq "" ) {
+            $state = 1;
+        }
+    }
+    elsif ( $state == 1 ) {
+        # Get site name and send request.
+        $state = 2;
+        if ( $sid < @sids ) {
+            print $remote $sids[$sid] . "o\n";
+            $sid++;
+        }
+        else {
+            print $remote "X\n";
+            last;
+        }
+    }
+    elsif (($state == 2) && ($line =~ /Weather Conditions/)) {
+        $state = 3;
+        @obs = ("$line\n");
+    }
+    elsif ( $state == 3 ) {
+        if ($line eq "") {
+            $state = 100;
+            add_obs($sids[$sid-1]);
+        }
+        else {
+            @obs = (@obs, "$line\n");
+        }
+    }
+    elsif ( $state == 100 ) {
+        if ( $line =~ /Help/ ) {
+            $state = 1;
+        }
+    }
+}
+
+$dbh->disconnect;
+
+#
+# This subroutine takes as input the several lines that make up an
+# acutal observation and parses out the needed data to place it in
+# the database.
+#
+sub add_obs
+{
+    my ($site) = @_;
+    # @obs must be set.
+    #
+    my ($wx_state, $offset) = 0;
+    my ($line) = "";
+    my ($prev) = "";
+    my ($hour, $ampm, $tz, $day, $mon, $year, $city, $state, $timestamp);
+    my ($temperature, $humidity, $pressure, $wind_speed, $wind_direction);
+    my ($weather);
+
+    for $line (@obs) {
+
+        #print "$line";
+        chomp ( $line );
+    
+        if ( $line eq "" ) {
+            $wx_state = 0;
+            next;
+        }
+        elsif ( $line =~ /Weather Conditions/ ) {
+            $wx_state = 1;
+            $line =~ s/.*Weather Conditions at //;
+            $line =~ s/on //;
+            $line =~ s/for //;
+            $line =~ s/[,.]//g;
+            ($hour, $ampm, $tz, $day, $mon, $year, $city, $state) = 
+                                             split( /\s+/, $line ); 
+
+print "SPLIT $line\n";
+            if ( $hour =~ /\:/ ) {
+                ($hour,$min) = split(/\:/,$hour);
+		if ( lc($ampm) eq "pm" && $hour < 12 ) {
+			$hour += 12;
+		}
+		if ( lc($ampm) eq "am" && $hour == 12 ) {
+			$hour = 0;
+		}
+                if ( $min >= 30 ) { 
+			$hour++;
+			$hour = 0 if ( $hour == 24 );
+                }
+            }
+            $timestamp = "$year-" . $months{$mon} . "-$day $hour:00:00";
+#Weather Conditions at 11:54 AM EST on 15 Jan 2013 for Baltimore, MD.
+#11:54 AM EST 15 Jan 2013 Baltimore MD [2013-01-15 0:00:00]
+print "$line [$timestamp]\n";
+        }
+        elsif ( ($line =~ /^Temp/) || ($line =~ /^\=/) ) {
+            next;
+        }
+        elsif ( $wx_state == 1 ) {
+    
+            $wx_state++;
+    
+            $temperature = "NULL";
+            $humidity    = "NULL";
+            $wind_direction = "NULL";
+            $wind_speed     = "NULL";
+            $pressure       = "NULL";
+            $weather        = "NULL";
+    
+            $line =~ s/^\s*//;
+            my (@observations) = split ( /\s+/, $line );
+    
+            if ( $observations[0] !~ /N\/A/ ) {
+                $temperature = $observations[0];
+            }
+    
+            if ( $observations[1] !~ /N\/A/ ) {
+                $humidity = $observations[1];
+                $humidity =~ s/\%//;
+                if ( $humidity > 100 ) {
+                    $humidity = "NULL";
+                    print STDERR "Invalid Humidity ($observations[1])\n";
+                    print STDERR "PREV: $prev\nCURRENT: $line\n";
+                }
+            }
+    
+            if ( $observations[2] eq "CALM" ) {
+                $offset = 3;
+                $wind_direction = 0;
+                $wind_speed     = 0;
+            }
+            elsif ( $observations[2] ne "N/A" ) {
+                $offset = 5;
+                $wind_direction = $degrees{$observations[2]};
+                $wind_speed     = $observations[4];
+		if ( $wind_speed eq "N/A" ) {
+			$wind_speed = 0;
+		}
+                if ( $wind_speed == 0 ) {
+                    $wind_direction = 0;  # Force direction to 0 if speed is 0.
+                }
+            }
+            else {
+                if ( $observations[3] eq "at" ) {
+                    $offset = 5;
+                }
+                else {
+                    $offset = 3;
+                }
+            }
+    
+            if ( $observations[$offset] ne "N/A" ) {
+                $pressure = $observations[$offset];
+                if ( ($pressure < 25) || ($pressure > 35) ) {
+                    $pressure = "NULL";
+                }
+            }
+    
+            $offset++;
+    
+            if ( $observations[$offset] ne "N/A" ) {
+                $weather = "";
+                for ( ; $offset < @observations; $offset++ ) {
+                    $weather .= $observations[$offset] . " ";
+                }
+                chop ( $weather );
+                check_pwx ( $weather );
+            }
+    
+            $update = "REPLACE INTO observations VALUES
+                       ('$site','$timestamp',
+                        $temperature, $humidity, $wind_direction, $wind_speed,
+                        $pressure, ";
+    
+            if ( $weather eq "NULL" ) {
+                $update .= "NULL)";
+            }
+            else {
+                $update .= "'$weather')";
+            }
+            $dbh->do ($update);
+            if ( $DBI::err > 1 ) {
+              print "-------------------------------------------------------\n";
+              print STDERR "$update\n";
+              print STDERR "$DBI::errstr\n";
+              print "-------------------------------------------------------\n";
+            }
+        }
+        else {
+            print STDERR "State $wx_state.  Found:\n$line\nPrev: $prev\n";
+        }
+        $prev = $line;
+    }
+}
+
+sub check_pwx
+{
+    ($pwx) = @_;
+
+    for $item ( @valid_pwx ) {
+        return if ( $item eq $pwx );
+    }
+    print STDERR $pwx, "\n";
+}
