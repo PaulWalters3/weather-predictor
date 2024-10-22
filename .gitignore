@@ -1,3 +1,5 @@
 neural
+neural.data/*.DAT
+neural.data/archive
 neural.source
 tools/schema-with-sites.sql
